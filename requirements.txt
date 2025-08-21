@@ -4,6 +4,5 @@ numpy
 pandas
 deepface
 face-recognition
-dlib
 Pillow
 email-validator
