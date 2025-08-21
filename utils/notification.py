@@ -1,4 +1,5 @@
 import os
+import streamlit as st
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -8,8 +9,8 @@ from datetime import datetime
 # ============ CONFIG ============
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-SENDER_EMAIL = "your_email@gmail.com"       # Change this
-SENDER_PASSWORD = os.getenv("EMAIL_APP_PASSWORD")       # Use App Password, not real password!
+SENDER_EMAIL = st.secrets["EMAIL_ADDRESS"]      
+SENDER_PASSWORD = st.secrets["EMAIL_APP_PASSWORD"] 
 # ================================
 
 
@@ -84,11 +85,13 @@ def send_attendance_summary(receiver_email, student_name, present_days, total_da
     <p>Best Regards,<br>Student Attendance System</p>
     """
     send_email(receiver_email, subject, message, html=True)
-
-
-# Example usage
-if __name__ == "__main__":
-    # Send test reminder
-    send_exam_reminder("student_email@example.com", "Computer Science Exam", "2025-09-10")
-    # Send test attendance summary
-    send_attendance_summary("student_email@example.com", "John Doe", 18, 20)
+def notify_student_on_login(student_id, student_name):
+    """ Notify student via email on successful login."""
+    subject = "Login Successful"
+    message = f"""
+    <h3>Hello {student_name},</h3>
+    <p>You have successfully logged in to the Student Attendance System.</p>
+    <br>
+    <p>Best Regards,<br>Student Attendance System</p>
+    """
+    send_email(st.secrets["EMAIL_ADDRESS"], subject, message, html=True)
