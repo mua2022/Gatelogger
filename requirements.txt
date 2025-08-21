@@ -3,6 +3,5 @@ opencv-python-headless
 numpy
 pandas
 deepface
-face-recognition
 Pillow
 email-validator
