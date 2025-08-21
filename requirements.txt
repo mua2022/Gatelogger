@@ -1,0 +1,10 @@
+streamlit
+opencv-python-headless
+numpy
+pandas
+deepface
+face-recognition
+dlib
+Pillow
+sqlite3-bro
+email-validator
