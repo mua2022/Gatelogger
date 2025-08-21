@@ -6,5 +6,4 @@ deepface
 face-recognition
 dlib
 Pillow
-sqlite3-bro
 email-validator
