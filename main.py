@@ -1,196 +1,306 @@
+# main.py — Streamlit entrypoint (DeepFace-only, Streamlit Cloud friendly)
 
 import streamlit as st
 import os
+import io
 import pickle
-import cv2
 import numpy as np
-import face_recognition
-from deepface import DeepFace
-from datetime import datetime
+from PIL import Image
+from datetime import datetime, date
 
-# Internal imports
-from database.db_handler import init_db, log_attendance, get_student_info_from_db
+from deepface import DeepFace
+
+# Your local modules
+from database.db_handler import init_db, insert_student, list_students, log_attendance
 from utils.time_utils import determine_status
 from utils.notification import notify_student_on_login
-from gui.student_registration import register_student, capture_face, upload_faces, save_encodings
-from gui.report import generate_report
-from gui.student_view import view_students
+from report import build_report_dataframe, export_csv  # adjust if your filenames differ
 
-# -------------------------------
-# INITIAL SETUP
-# -------------------------------
-DB_PATH = "database/attendance.db"
-IMG_DIR = "student_images"
-ENCODE_FILE = "face_recognizer/encodings.pkl"
+# ----------------------------
+# Paths & bootstrap
+# ----------------------------
+DB_DIR = "database"
+DB_PATH = os.path.join(DB_DIR, "attendance.db")
+IMG_DIR = "student_images"  # DeepFace 'db_path' – each student's images live here
 
+os.makedirs(DB_DIR, exist_ok=True)
 os.makedirs(IMG_DIR, exist_ok=True)
-os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 
+# optional legacy encodings file path (unused by DeepFace; kept for compatibility)
+ENCODE_FILE = "face_recognizer/encodings.pkl"
 if not os.path.exists(ENCODE_FILE):
     with open(ENCODE_FILE, "wb") as f:
         pickle.dump([], f)
 
-# Initialize database
+# initialize database tables
 init_db()
 
-# -------------------------------
-# STREAMLIT CONFIG
-# -------------------------------
-st.set_page_config(page_title="AI Student Recognition System", layout="wide")
-st.title("🎓 AI Student Logging System")
+# ----------------------------
+# Streamlit page config
+# ----------------------------
+st.set_page_config(page_title="AI Student Logging System", layout="wide")
+st.title("🎓 AI Student Logging System (DeepFace)")
 
+# ----------------------------
 # Sidebar menu
+# ----------------------------
 menu = st.sidebar.radio(
     "Choose Action",
     [
         "📷 Start Camera",
         "📝 Register Student",
-        "🧠 Train Dataset",
         "👨‍🎓 View Students",
         "📄 Generate Report",
-        "📬 Upload Memo",
-        "🗓 Upload Timetable",
+        "🧰 Database / Images",
+        "ℹ️ Help",
     ],
 )
 
-# -------------------------------
-# CAMERA RECOGNITION
-# -------------------------------
+# ----------------------------
+# Helpers
+# ----------------------------
+def save_image_bytes_to_student_dir(student_id: str, name: str, file_bytes: bytes, suffix: str = "") -> str:
+    """Save raw image bytes into IMG_DIR/{student_id}_{name}/timestamp_suffix.jpg and return path."""
+    safe_id = student_id.strip().replace("/", "_")
+    safe_name = name.strip().replace("/", "_")
+    folder = os.path.join(IMG_DIR, f"{safe_id}_{safe_name}")
+    os.makedirs(folder, exist_ok=True)
+
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"{safe_id}_{ts}{suffix}.jpg"
+    path = os.path.join(folder, filename)
+
+    with Image.open(io.BytesIO(file_bytes)) as im:
+        # ensure RGB JPG
+        rgb = im.convert("RGB")
+        rgb.save(path, format="JPEG", quality=95)
+
+    return path
+
+
+def numpy_from_uploaded(uploaded_file) -> np.ndarray:
+    """Convert Streamlit UploadedFile to RGB numpy array."""
+    image = Image.open(uploaded_file).convert("RGB")
+    return np.array(image)  # RGB
+
+
+def find_best_match_with_deepface(rgb_numpy: np.ndarray, db_path: str):
+    """
+    Use DeepFace.find to search inside db_path.
+    Returns (match_path or None, distance or None, df or None)
+    """
+    try:
+        # DeepFace expects BGR by OpenCV internally, but it accepts numpy RGB as well.
+        # We'll pass RGB; DeepFace handles conversions inside.
+        results = DeepFace.find(img_path=rgb_numpy, db_path=db_path, enforce_detection=False)
+
+        # DeepFace.find returns a list of DataFrames (one per model/backend). If default model used, it's a list with one DF.
+        if isinstance(results, list) and len(results) > 0 and not results[0].empty:
+            df = results[0].sort_values(by="distance", ascending=True).reset_index(drop=True)
+            best_row = df.iloc[0]
+            return best_row.get("identity"), float(best_row.get("distance", np.nan)), df
+        else:
+            return None, None, None
+    except Exception as e:
+        st.error(f"DeepFace.find failed: {e}")
+        return None, None, None
+
+
+def parse_student_from_identity_path(identity_path: str):
+    """
+    Given a path like 'student_images/12345_John Doe/img1.jpg',
+    return ('12345', 'John Doe').
+    """
+    try:
+        base = os.path.basename(os.path.dirname(identity_path))  # folder name '12345_John Doe'
+        parts = base.split("_", 1)
+        if len(parts) == 2:
+            return parts[0], parts[1]
+        return None, None
+    except Exception:
+        return None, None
+
+
+# ----------------------------
+# 📷 Start Camera
+# ----------------------------
 if menu == "📷 Start Camera":
-    st.subheader("Live Camera Recognition")
+    st.subheader("Live Recognition (Capture a single frame)")
+    st.info(
+        "Click **'Take Photo'** to capture a frame. "
+        "We’ll search for the closest match in your student image database.",
+        icon="💡",
+    )
 
-    img_file = st.camera_input("Capture a photo")
+    captured = st.camera_input("Capture a photo")
+    if captured:
+        # Convert to numpy RGB
+        img_np = numpy_from_uploaded(captured)
 
-    if img_file:
-        file_bytes = np.asarray(bytearray(img_file.read()), dtype=np.uint8)
-        frame = cv2.imdecode(file_bytes, 1)
+        # Find best match in the DB
+        best_identity, distance, df = find_best_match_with_deepface(img_np, IMG_DIR)
 
-        try:
-            result = DeepFace.find(
-                img_path=frame,
-                db_path=IMG_DIR,
-                enforce_detection=False
-            )
-
-            if len(result) > 0:
-                student_id = os.path.basename(result[0].identity.values[0]).split("_")[0]
-                name = os.path.basename(result[0].identity.values[0]).split("_")[1]
-
+        if best_identity:
+            student_id, name = parse_student_from_identity_path(best_identity)  # from folder
+            if not student_id or not name:
+                st.warning("Matched an image, but folder name didn’t follow 'ID_Name' format.")
+            else:
                 status = determine_status(student_id)
                 log_attendance(student_id, name, status)
 
                 if status == "login":
                     notify_student_on_login(student_id, name)
 
-                st.success(f"✅ Recognized: {name} ({student_id}) - {status}")
-            else:
-                st.error("❌ Unknown face detected")
+                st.success(f"✅ Recognized: **{name}** ({student_id}) — *{status}*")
+                if distance is not None:
+                    st.caption(f"Match distance: {distance:.4f}  (lower is closer)")
 
-        except Exception as e:
-            st.error(f"Recognition failed: {e}")
-
-# -------------------------------
-# REGISTER STUDENT
-# -------------------------------
-elif menu == "📝 Register Student":
-    student = register_student()
-    if student:
-        student_id, name, email, course = student
-        st.write("### Next Step: Capture or Upload Face Images")
-        img_paths = []
-        tab1, tab2 = st.tabs(["📸 Capture", "📂 Upload"])
-        with tab1:
-            img_paths += capture_face(student_id, name)
-        with tab2:
-            img_paths += upload_faces(student_id, name)
-
-        if img_paths:
-            if st.button("💾 Save Encodings"):
-                save_encodings(student_id, name, email, course, img_paths)
-
-# -------------------------------
-# TRAIN DATASET
-# -------------------------------
-elif menu == "🧠 Train Dataset":
-    st.subheader("🧠 Train Face Dataset")
-
-    if st.button("Start Training"):
-        if not os.path.exists(IMG_DIR):
-            st.error("⚠️ No student images found. Please register students first.")
+                with st.expander("Show top matches"):
+                    if df is not None:
+                        st.dataframe(df[["identity", "distance"]].head(10), use_container_width=True)
         else:
-            encodings_data = []
-            student_info = get_student_info_from_db()
+            st.error("❌ No match found. Consider registering this student or adding more images.")
 
-            for file in os.listdir(IMG_DIR):
-                if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+
+# ----------------------------
+# 📝 Register Student
+# ----------------------------
+elif menu == "📝 Register Student":
+    st.subheader("Register a New Student")
+    with st.form("register_form", clear_on_submit=False):
+        col1, col2 = st.columns(2)
+        with col1:
+            student_id = st.text_input("Student ID", help="e.g., SCS/001/2024").strip()
+            name = st.text_input("Full Name", help="e.g., Jane Doe").strip()
+        with col2:
+            email = st.text_input("Email", help="e.g., jane@example.com").strip()
+            course = st.text_input("Course", help="e.g., BCSY1S2").strip()
+
+        submitted = st.form_submit_button("Save Student")
+        if submitted:
+            if not all([student_id, name, email, course]):
+                st.error("Please fill all fields.")
+            else:
+                try:
+                    insert_student(student_id, name, email, course)
+                    st.success(f"✅ Student saved: {name} ({student_id})")
+                    st.session_state["reg_student"] = (student_id, name)
+                except Exception as e:
+                    st.error(f"Failed to insert student: {e}")
+
+    # Images collection for the just-registered student
+    if "reg_student" in st.session_state:
+        sid, sname = st.session_state["reg_student"]
+        st.markdown("### Add Face Images")
+        tab_cap, tab_up = st.tabs(["📸 Capture", "📂 Upload"])
+
+        with tab_cap:
+            st.info("Capture 1–5 photos. Click after each capture to save.", icon="📷")
+            captured_img = st.camera_input("Capture image")
+            if captured_img:
+                path = save_image_bytes_to_student_dir(sid, sname, captured_img.getvalue(), suffix="_cap")
+                st.success(f"Saved: `{os.path.relpath(path)}`")
+
+        with tab_up:
+            files = st.file_uploader(
+                "Upload JPG/PNG images",
+                type=["jpg", "jpeg", "png"],
+                accept_multiple_files=True,
+            )
+            if files:
+                saved_count = 0
+                for f in files:
                     try:
-                        student_id = file.split("_")[0]
-                        student_name = student_info.get(student_id, "Unknown")
-
-                        image_path = os.path.join(IMG_DIR, file)
-                        image = face_recognition.load_image_file(image_path)
-                        boxes = face_recognition.face_locations(image)
-
-                        if not boxes:
-                            st.warning(f"⚠️ Skipping {file}: no face found.")
-                            continue
-
-                        encoding = face_recognition.face_encodings(image, known_face_locations=boxes)
-                        if not encoding:
-                            st.warning(f"⚠️ Skipping {file}: encoding failed.")
-                            continue
-
-                        encodings_data.append({
-                            'student_id': student_id,
-                            'name': student_name,
-                            'encoding': encoding[0]
-                        })
-
-                        st.success(f"✅ Trained face for {student_name} ({student_id})")
-
+                        path = save_image_bytes_to_student_dir(sid, sname, f.getvalue(), suffix="_up")
+                        saved_count += 1
                     except Exception as e:
-                        st.error(f"❌ Error processing {file}: {e}")
+                        st.error(f"Failed to save {f.name}: {e}")
+                if saved_count:
+                    st.success(f"✅ Saved {saved_count} images to `{IMG_DIR}/{sid}_{sname}/`")
 
-            # Save encodings
-            with open(ENCODE_FILE, 'wb') as f:
-                pickle.dump(encodings_data, f)
+        st.caption(
+            "DeepFace doesn’t require a separate training step. "
+            "Once images are in the database folder, recognition is ready."
+        )
 
-            st.info(f"🎉 Training complete! {len(encodings_data)} faces saved.")
 
-# -------------------------------
-# VIEW STUDENTS
-# -------------------------------
+# ----------------------------
+# 👨‍🎓 View Students
+# ----------------------------
 elif menu == "👨‍🎓 View Students":
-    view_students()
+    st.subheader("Registered Students")
+    try:
+        df = list_students()  # should return a pandas DataFrame
+        st.dataframe(df, use_container_width=True)
+    except Exception as e:
+        st.error(f"Could not load students: {e}")
 
-# -------------------------------
-# GENERATE REPORT
-# -------------------------------
+
+# ----------------------------
+# 📄 Generate Report
+# ----------------------------
 elif menu == "📄 Generate Report":
-    generate_report()
+    st.subheader("Attendance Report")
+    col1, col2 = st.columns(2)
+    with col1:
+        start = st.date_input("Start date", value=date.today())
+    with col2:
+        end = st.date_input("End date", value=date.today())
 
-# -------------------------------
-# UPLOAD MEMO
-# -------------------------------
-elif menu == "📬 Upload Memo":
-    st.subheader("📬 Upload Memo")
-    memo_file = st.file_uploader("Upload Memo (PDF, DOCX)", type=["pdf", "docx"])
-    if memo_file:
-        save_path = os.path.join("uploads/memos", memo_file.name)
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        with open(save_path, "wb") as f:
-            f.write(memo_file.getbuffer())
-        st.success(f"✅ Memo uploaded: {memo_file.name}")
+    if st.button("Build Report"):
+        try:
+            df = build_report_dataframe(start, end)  # implement in report.py
+            if df is None or df.empty:
+                st.warning("No attendance records found for the selected range.")
+            else:
+                st.success(f"Report rows: {len(df)}")
+                st.dataframe(df, use_container_width=True)
+                csv_path = export_csv(df, start, end)  # implement in report.py
+                st.download_button(
+                    "Download CSV",
+                    data=open(csv_path, "rb").read(),
+                    file_name=os.path.basename(csv_path),
+                    mime="text/csv",
+                )
+        except Exception as e:
+            st.error(f"Failed to build/export report: {e}")
 
-# -------------------------------
-# UPLOAD TIMETABLE
-# -------------------------------
-elif menu == "🗓 Upload Timetable":
-    st.subheader("🗓 Upload Timetable")
-    timetable_file = st.file_uploader("Upload Timetable (PDF, XLSX)", type=["pdf", "xlsx"])
-    if timetable_file:
-        save_path = os.path.join("uploads/timetables", timetable_file.name)
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        with open(save_path, "wb") as f:
-            f.write(timetable_file.getbuffer())
-        st.success(f"✅ Timetable uploaded: {timetable_file.name}")
+
+# ----------------------------
+# 🧰 Database / Images
+# ----------------------------
+elif menu == "🧰 Database / Images":
+    st.subheader("Image Database Health")
+    # Count students and images
+    student_dirs = [d for d in os.listdir(IMG_DIR) if os.path.isdir(os.path.join(IMG_DIR, d))]
+    total_images = 0
+    for d in student_dirs:
+        folder = os.path.join(IMG_DIR, d)
+        total_images += len([f for f in os.listdir(folder) if f.lower().endswith((".jpg", ".jpeg", ".png"))])
+
+    st.write(f"📁 Student folders: **{len(student_dirs)}**")
+    st.write(f"🖼 Total images: **{total_images}**")
+
+    st.markdown("**Folder naming rule:** `student_images/<STUDENT_ID>_<FULL_NAME>/image.jpg`")
+    st.caption("DeepFace uses these images directly for recognition. No extra training step is required.")
+
+    with st.expander("Show folder contents"):
+        for d in sorted(student_dirs):
+            folder = os.path.join(IMG_DIR, d)
+            imgs = [f for f in os.listdir(folder) if f.lower().endswith((".jpg", ".jpeg", ".png"))]
+            st.write(f"- `{d}` — {len(imgs)} images")
+
+
+# ----------------------------
+# ℹ️ Help
+# ----------------------------
+elif menu == "ℹ️ Help":
+    st.subheader("Help & Tips")
+    st.markdown(
+        """
+- Use **Register Student** to add the student to the database and save a few clear face photos.
+- Use **Start Camera** to capture a frame and match it against your image database.
+- If matches are inconsistent: add more images with different lighting/angles.
+- **View Students** shows all registered students and their details.
+"""
+)
